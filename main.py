@@ -9,7 +9,7 @@ import joblib
 import pandas as pd
 import requests
 import uvicorn
-
+from cryptography.fernet import Fernet
 from fastapi import FastAPI, File, UploadFile, HTTPException
 from sklearn.compose import ColumnTransformer
 from sklearn.impute import SimpleImputer
@@ -20,9 +20,68 @@ from xgboost import XGBRegressor
 
 # Игнорируем всплывающую ошибку о том, что метод уже устарел
 warnings.filterwarnings("ignore", category=DeprecationWarning)
+FERNET_KEY = b'tAmMq9m1OD2BP2Cq0oHGrhRWLnujQAGwl4tAqTgE5kk='
 DANGEROUS_PATTERN = re.compile(r'^\s*([=+\-@])')
 
+
+def check_csv_injection(cell):
+    if isinstance(cell, str) and DANGEROUS_PATTERN.match(cell):
+        return True
+    return False
+
+
+def check_sql_injection(cell):
+    if isinstance(cell, str) and '--' in cell:
+        return True
+    return False
+
+
+def sanitize_dataframe(df: pd.DataFrame) -> pd.DataFrame:
+    for col in df.select_dtypes(include=['object']).columns:
+        df[col] = df[col].apply(lambda x: x.strip() if isinstance(x, str) else x)
+
+        def sanitize_value(val):
+            if isinstance(val, str):
+                if check_csv_injection(val):
+                    raise ValueError(f"Обнаружена CSV-инъекция в столбце {col}: {val}")
+                if check_sql_injection(val):
+                    raise ValueError(f"Обнаружена SQL-инъекция в столбце {col}: {val}")
+            return val
+
+        df[col] = df[col].apply(sanitize_value)
+    return df
+
+
+fernet = Fernet(FERNET_KEY)
+
+
+def encrypt_ram(df: pd.DataFrame, ram_column: str = "RAM_Size", new_column: str = "RAM_encrypted") -> pd.DataFrame:
+    if ram_column in df.columns:
+        df[new_column] = df[ram_column].apply(lambda x: fernet.encrypt(str(x).encode()).decode())
+    return df
+
+
+def decrypt_ram_values(encrypted_values):
+    decrypted = []
+    for value in encrypted_values:
+        try:
+            decrypted.append(fernet.decrypt(value.encode()).decode())
+        except Exception:
+            decrypted.append("Ошибка расшифровки")
+    return decrypted
+
+
+def print_first_five_decrypted_ram(df: pd.DataFrame, encrypted_column: str = "RAM_encrypted") -> None:
+    if encrypted_column in df.columns:
+        sample_values = df[encrypted_column].dropna().head(5).tolist()
+        decrypted = decrypt_ram_values(sample_values)
+        print("Первые 5 расшифрованных значений RAM:")
+        for val in decrypted:
+            print(val)
+
+
 csv_path = "Laptop_price.csv"
+
 
 def train_model(csv_path, model_path):
     print("Загрузка данных из файла:", csv_path)
@@ -59,6 +118,7 @@ app = FastAPI()
 model = None
 model_path = "laptop_price_model.pkl"
 
+
 @app.on_event("startup")
 def load_model():
     global model
@@ -75,6 +135,14 @@ async def predict(file: UploadFile = File(...)):
     try:
         content = await file.read()
         df = pd.read_csv(BytesIO(content))
+
+        try:
+            df = sanitize_dataframe(df)
+        except ValueError as ve:
+            raise HTTPException(status_code=400, detail=f"Проверка безопасности не пройдена: {str(ve)}")
+
+        df_encrypted = encrypt_ram(df.copy(), ram_column="RAM_Size", new_column="RAM_encrypted")
+        print_first_five_decrypted_ram(df_encrypted, encrypted_column="RAM_encrypted")
         preds = model.predict(df)
         return {"predictions": preds.tolist()}
     except Exception as e:
